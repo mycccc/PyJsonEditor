@@ -16,3 +16,6 @@ dist/
 *.bak
 *.log
 .bak.*
+
+# Development / private files
+_dev/
