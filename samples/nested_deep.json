@@ -1,0 +1,28 @@
+{
+  "level1": {
+    "level2": {
+      "level3": {
+        "level4": {
+          "level5": {
+            "level6": {
+              "level7": {
+                "level8": {
+                  "bottom": "到底了"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "mixed": {
+    "array_of_objects": [
+      {"id": 1, "tags": ["a", "b", {"deep": true}]},
+      {"id": 2, "tags": []},
+      {"id": 3, "tags": [{"deeper": {"deepest": [1, [2, [3]]]}}]}
+    ],
+    "empty_object": {},
+    "empty_array": []
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "name": "PyJsonEditor",
+  "version": "1.0",
+  "features": ["格式化", "压缩", "展开收缩", "查找替换过滤"],
+  "counts": {"stars": 42, "forks": 7},
+  "tags": ["零依赖", "跨平台", "语义保真"],
+  "active": true,
+  "homepage": null,
+  "ratio": 0.618
+}

@@ -1,0 +1,7 @@
+# PyJSONEditor —— 无任何第三方依赖
+# 仅需 Python >= 3.10，且 tkinter 可用：
+#   macOS (python.org 安装包): 自带
+#   macOS (Homebrew):          brew install python-tk
+#   Debian/Ubuntu:             sudo apt install python3-tk
+#   Windows (python.org):      自带
+# 验证: python3 -m tkinter
