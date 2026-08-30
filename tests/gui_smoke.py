@@ -11,6 +11,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 import pyjsoneditor as je  # noqa: E402
 
+# Windows 控制台默认非 UTF-8，断言名含中文会 UnicodeEncodeError
+je._ensure_utf8_stdio()
+
 # 弹窗可控自动应答，避免阻塞
 ANS = {"yesno": True, "yesnocancel": True}
 je.messagebox.askyesno = lambda *a, **k: ANS["yesno"]
@@ -242,6 +245,7 @@ def step7():
 
 def step8():
     """Cmd/Ctrl+Up/Down 必须移动选中行（widget 层绑定，class Keynav 不抢跑）。"""
+    app.deiconify()  # 无头环境窗口可能未映射，合成按键事件需窗口可见才派发
     app.update()
     app.open_file(tmp)
     app.open_paths = {(), ("items",)}

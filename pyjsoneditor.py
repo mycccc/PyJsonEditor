@@ -2603,7 +2603,23 @@ class App(tk.Tk):
         self.text_pane.apply_theme(th)
 
 
+def _ensure_utf8_stdio() -> None:
+    """Windows 控制台默认 cp1252/gbk，直接 print 中文会 UnicodeEncodeError。
+
+    GUI 模式下 stdout 也可能被重定向到管道（默认 ANSI 代码页），故一律兜底。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        enc = (getattr(stream, "encoding", "") or "").lower().replace("-", "")
+        if enc == "utf8":
+            continue
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
 def main(argv: List[str]) -> int:
+    _ensure_utf8_stdio()
     if "--selftest" in argv:
         return _selftest()
     _run_gui(argv)
