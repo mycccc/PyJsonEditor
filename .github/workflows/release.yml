@@ -1,0 +1,70 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    name: Verify - ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+        python:
+          - "3.10"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python ${{ matrix.python }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      # Linux runner 无显示环境：Tk 需要 Xvfb，仅装 python3-tk 不够
+      - name: Install Tk runtime on Linux
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-tk xvfb
+
+      - name: Check Python
+        run: python --version
+
+      - name: Run data-layer selftest
+        run: python pyjsoneditor.py --selftest
+
+      - name: Run GUI smoke test
+        if: runner.os != 'Linux'
+        run: python tests/gui_smoke.py
+
+      - name: Run GUI smoke test (Xvfb)
+        if: runner.os == 'Linux'
+        run: xvfb-run -a python tests/gui_smoke.py
+
+  release:
+    name: Create GitHub Release
+    needs: test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Create Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --repo "${{ github.repository }}" \
+            --title "PyJsonEditor ${{ github.ref_name }}" \
+            --generate-notes
