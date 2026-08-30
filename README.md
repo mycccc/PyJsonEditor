@@ -12,7 +12,7 @@ A lightweight JSON editor built with Python and Tkinter.
 python3 pyjsoneditor.py               # 空文档启动
 python3 pyjsoneditor.py config.json   # 打开指定文件
 python3 pyjsoneditor.py --selftest    # 数据层自测（40+ 项断言，含 300 轮随机属性测试，无 GUI）
-python3 _dev/gui_smoke.py            # GUI 冒烟测试（36 项，自动应答弹窗）
+python3 tests/gui_smoke.py           # GUI 冒烟测试（47 项，自动应答弹窗）
 ```
 
 ## 功能
@@ -52,7 +52,7 @@ python3 _dev/gui_smoke.py            # GUI 冒烟测试（36 项，自动应答�
 
 键顺序、中文（不转义）、整数/浮点/布尔/null 类型**完整保留**。
 
-## 设计要点（详见 `_dev/design-log.md`）
+## 设计要点
 
 - 单一数据源 `JsonModel`，树与文本只是投影；所有修改必须经 Command → History（mutation guard 常开强制）
 - dirty 由**语义指纹**（canonical 序列化 sha256）相对磁盘快照判断——改了再撤销，dirty 自动归 False
@@ -66,4 +66,4 @@ python3 _dev/gui_smoke.py            # GUI 冒烟测试（36 项，自动应答�
 
 ## 后续计划（V2）
 
-macOS `.app` / Windows `.exe` / Linux 打包与系统文件关联、鼠标拖拽排序、多文件 Tab、JSONPath 定位、JSON5/JSONC 一等支持、复制粘贴子树。打包注意事项见 `build/README.md`。
+macOS `.app` / Windows `.exe` / Linux 打包与系统文件关联、鼠标拖拽排序、多文件 Tab、JSONPath 定位、JSON5/JSONC 一等支持、复制粘贴子树。打包注意事项见 `docs/build-notes.md`。
