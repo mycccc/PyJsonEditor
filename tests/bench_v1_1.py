@@ -170,6 +170,7 @@ def bench_gui() -> int:
 def main() -> int:
     if "--gui" in sys.argv:
         return bench_gui()
+    M._ensure_utf8_stdio()  # Windows 控制台 cp1252 下 print 中文会崩溃
     print("PyJsonEditor V1.1 性能基准线")
     print("节点规模: %s  轮次/操作: %d" % (SIZES, ROUNDS))
     print("-" * 78)
