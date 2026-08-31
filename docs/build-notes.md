@@ -1,4 +1,6 @@
-# 打包说明（V2 阶段实施，本期仅记录）
+# 打包说明
+
+V1.1 正式产物仅 macOS（arm64 + x86_64 双 zip）；Windows/Linux 仅在 CI 中做构建冒烟验证（不产出正式物，v1.2 扩展）。
 
 ## 通用
 
@@ -7,20 +9,28 @@ pip install pyinstaller
 pyinstaller --noconfirm --clean --windowed --name "PyJsonEditor" pyjsoneditor.py
 ```
 
-- 单文件模式（`--onefile`）启动慢且易被杀软误报，建议用目录模式（默认）。
-- 无数据文件依赖，无需 `--add-data`。
+- 目录模式（默认，不用 `--onefile`）：启动快且不易被杀软误报
+- 无数据文件依赖，无需 `--add-data`
 
-## macOS .app
+## macOS .app（V1.1 正式产物）
 
-1. 产物 `dist/PyJsonEditor.app`；未签名会被 Gatekeeper 拦截：
-   - 本机自用：右键打开，或 `codesign --force --deep -s - dist/PyJsonEditor.app`（ad-hoc）
-   - 分发：需 Apple Developer 账号签名 + 公证（notarytool）
-2. 关联 .json：编辑 `Info.plist` 加入 `CFBundleDocumentTypes`（LSItemContentTypes = public.json，
-   CFBundleTypeRole = Editor），并实现打开事件（`sys.argv` 或 tkinter 不自动收 ODOC，
-   需补 `tkinter` 的 open-file 处理或用 pyobj）
-3. universal2 需在对应架构机器上分别构建再 `lipo` 合并；建议只出 arm64 + x86_64 各一份
+1. 在对应架构的 runner 上分别构建（arm64 用 macos-latest，x86_64 用 macos-13）：
+   ```bash
+   pyinstaller --noconfirm --clean --windowed --name PyJsonEditor pyjsoneditor.py
+   mkdir -p "dist/PyJsonEditor-macos-<arch>"
+   mv "dist/PyJsonEditor.app" "dist/PyJsonEditor-macos-<arch>/"
+   cd dist && zip -r "PyJsonEditor-v1.1.0-macos-<arch>.zip" "PyJsonEditor-macos-<arch>/"
+   ```
+   - 产物命名：`PyJsonEditor-v1.1.0-macos-arm64.zip`、`PyJsonEditor-v1.1.0-macos-x64.zip`
+   - universal2 需两种架构分别构建再 `lipo` 合并；V1.1 采用双产物方案，不合并
+2. 未签名产物会被 Gatekeeper 拦截：
+   - 本机自用：右键 →「打开」；或 ad-hoc 签名
+     `codesign --force --deep -s - "dist/PyJsonEditor.app"`
+   - 对外分发：需 Apple Developer 账号签名 + 公证（notarytool）；v1.1.0 暂不执行，README 提示用户自行解除拦截
+3. 命令行入口已支持 `--version` / `--selftest`，.app 内可从终端运行
+   `"PyJsonEditor.app/Contents/MacOS/PyJsonEditor" --version` 验证
 
-## Windows .exe
+## Windows .exe（CI 冒烟，v1.2 正式化）
 
 1. 高 DPI：代码已处理（`SetProcessDpiAwareness(1)`）
 2. 文件关联：需安装程序写注册表（Inno Setup / NSIS）：
@@ -28,7 +38,7 @@ pyinstaller --noconfirm --clean --windowed --name "PyJsonEditor" pyjsoneditor.py
    再把 `.json` 的 OpenWithProgids 指过去（不要直接抢注 .json）
 3. 杀软误报：目录模式 + 代码签名证书可缓解
 
-## Linux
+## Linux（CI 冒烟，v1.2 正式化）
 
 - 目录模式产物直接可用；文件关联通过 `.desktop` 文件（`MimeType=application/json;`）+
   `update-desktop-database`
@@ -36,5 +46,6 @@ pyinstaller --noconfirm --clean --windowed --name "PyJsonEditor" pyjsoneditor.py
 
 ## 版本策略
 
+- 语义化版本：v1.0.0 / v1.1.0 / v1.2.0（旧 `v1` 标签已删除，不再使用）
 - 开发/打包环境 Python ≥ 3.10；代码不使用 Tk 9.0 特有 API
 - 交付物命名：`PyJsonEditor-<ver>-<platform>-<arch>`

@@ -19,3 +19,6 @@ dist/
 
 # Development / private files
 _dev/
+
+# CodeBuddy project data
+.codebuddy/

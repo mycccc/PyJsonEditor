@@ -19,12 +19,14 @@ PyJSONEditor — 一个基于 Python + Tkinter 的轻量级跨平台 JSON 编辑
 
 运行: python3 pyjsoneditor.py [文件.json]
 自测: python3 pyjsoneditor.py --selftest
+版本: python3 pyjsoneditor.py --version
 """
 
 from __future__ import annotations
 
 import glob
 import hashlib
+import itertools
 import json
 import os
 import re
@@ -43,13 +45,19 @@ from tkinter import filedialog, messagebox, ttk
 # ---------------------------------------------------------------------------
 
 APP_NAME = "PyJSONEditor"
-APP_VERSION = "1.0"
+APP_VERSION = "1.1.0"
 
 UNDO_LIMIT = 200            # 撤销栈上限（超出丢弃最早的命令）
-LAZY_BATCH = 500            # 树惰性加载：每批插入的节点数
+TREE_PAGE_SIZE = 2000       # V1.1.1：树分页虚拟化——每层最多实例化子项数，超出显示「双击加载更多」
 EXPAND_CONFIRM_LIMIT = 20000  # 「全部展开」节点数保护阈值
 HIGHLIGHT_LIMIT = 4 * 1024 * 1024  # 文本高亮上限：超过则跳过高亮（只保留行号）
-TEXT_WARN_LIMIT = 8 * 1024 * 1024  # 文本区性能警告阈值
+MAX_HL_LINE = 32000          # 单行超过此长度视为超长行：跳过该行高亮/括号匹配/行号 bbox
+TEXT_WARN_LIMIT = 8 * 1024 * 1024  # 文本区性能警告阈值（>此大小暂停实时解析）
+TEXT_REBUILD_LIMIT = 1 * 1024 * 1024  # V1.1.1：树编辑 → Text 重建防抖阈值（>此大小合并重建）
+TEXT_REBUILD_DELAY = 500            # 树编辑 → Text 大文档重建防抖（ms），连击编辑只重建一次
+PARSE_MID_LIMIT = 2 * 1024 * 1024  # 中档 debounce 起点（2MB）
+PARSE_DEBOUNCE_SMALL = 300         # <2MB：实时解析延迟（ms）
+PARSE_DEBOUNCE_MID = 600           # 2~8MB：中档延迟（ms）
 BACKUP_KEEP = 10            # 时间戳备份保留份数
 
 Path = Tuple[Any, ...]      # 根为 ()，dict 用 str key、list 用 int 下标逐段追加
@@ -589,12 +597,30 @@ class Command:
     def _undo(self, model: JsonModel) -> None:
         raise NotImplementedError
 
+    def affected_paths(self, direction: str = "do"):
+        """受影响的投影变更描述，供视图局部刷新（纯增量，不改数据语义）。
+
+        direction: "do" | "undo"。返回 (kind, ...)：
+          ("full", None)                 → 全量 rebuild（保守兜底）
+          ("update", path)               → 单行值更新（路径不变）
+          ("update_multi", [path, ...])  → 多行值更新
+          ("rename", parent_path)        → 父下直接子行重建（key 段变化使子 iid 全变）
+          ("insert", parent_path)        → 父下插入（list 级联由视图层降级）
+          ("delete", (parent, child))    → 父下删除
+          ("move", cur_path, delta)      → 相邻移动：cur_path 处元素移到 cur+delta
+        默认 ("full", None)：未知命令/文档级替换保守全量重建。
+        """
+        return ("full", None)
+
 
 class SetValueCommand(Command):
     """改值（含类型切换产生的值变化）。"""
 
     def __init__(self, path: Path, old: Any, new: Any):
         self.path, self.old, self.new = path, old, new
+
+    def affected_paths(self, direction: str = "do"):
+        return ("update", self.path)
 
     def _do(self, model: JsonModel) -> None:
         model.set_value(self.path, self.new)
@@ -612,6 +638,9 @@ class RenameKeyCommand(Command):
 
     def _undo(self, model: JsonModel) -> None:
         model.rename_key(self.parent_path, self.new_key, self.old_key)
+
+    def affected_paths(self, direction: str = "do"):
+        return ("rename", self.parent_path)
 
 
 class InsertCommand(Command):
@@ -633,6 +662,12 @@ class InsertCommand(Command):
 
     def path(self) -> Optional[Path]:
         return self.child_path
+
+    def affected_paths(self, direction: str = "do"):
+        if direction == "do":
+            return ("insert", self.parent_path)
+        # undo：恢复删除 → 视作删除该行（child_path 已记录）
+        return ("delete", (self.parent_path, self.child_path))
 
 
 class DeleteCommand(Command):
@@ -658,6 +693,14 @@ class DeleteCommand(Command):
         else:
             model.insert_child(self.parent_path, self.key, self.value)
 
+    def affected_paths(self, direction: str = "do"):
+        if not self.path:
+            return ("full", None)  # 根节点删除/恢复 → 文档级，全量重建
+        if direction == "do":
+            return ("delete", (self.parent_path, self.path))
+        # undo：恢复删除 → 视作插入（list 级联由视图层降级）
+        return ("insert", self.parent_path)
+
 
 class MoveCommand(Command):
     def __init__(self, path: Path, delta: int):
@@ -673,6 +716,13 @@ class MoveCommand(Command):
     def _undo(self, model: JsonModel) -> None:
         model.move_to(self.parent_path, self.new_index, self.old_index)
 
+    def affected_paths(self, direction: str = "do"):
+        if direction == "do":
+            return ("move", self.path, self.delta)
+        # undo：元素现位于 path+delta，移回原位置 path
+        cur = self.path[:-1] + (self.path[-1] + self.delta,)
+        return ("move", cur, -self.delta)
+
 
 class ReplaceAllCommand(Command):
     """批量替换（搜索替换的「全部替换」）—— 整体一个 undo 步骤。"""
@@ -687,6 +737,9 @@ class ReplaceAllCommand(Command):
     def _undo(self, model: JsonModel) -> None:
         for path, old, _new in reversed(self.pairs):
             model.set_value(path, old)
+
+    def affected_paths(self, direction: str = "do"):
+        return ("update_multi", [p for p, _o, _n in self.pairs])
 
 
 class ReplaceDocumentCommand(Command):
@@ -1144,7 +1197,7 @@ _TOKEN_RE = re.compile(
     r'"(?:[^"\\]|\\.)*"'
     r'|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?'
     r'|true|false|null'
-    r'|[{}\[\],:]'
+    r'|[(){}[\],:]'
 )
 
 
@@ -1182,61 +1235,118 @@ class TextPane(ttk.Frame):
                             highlightthickness=0, font=(MONO_FONT, 13),
                             insertwidth=2)
         self.linenums = tk.Canvas(self, width=52, bd=0, highlightthickness=0)
-        vs = ttk.Scrollbar(self, orient="vertical", command=self.text.yview)
+        self._vs = ttk.Scrollbar(self, orient="vertical", command=self.text.yview)
         hs = ttk.Scrollbar(self, orient="horizontal", command=self.text.xview)
-        self.text.configure(yscrollcommand=vs.set, xscrollcommand=hs.set)
+        self.text.configure(yscrollcommand=self._on_vscroll, xscrollcommand=hs.set)
         self.linenums.grid(row=0, column=0, sticky="ns")
         self.text.grid(row=0, column=1, sticky="nsew")
-        vs.grid(row=0, column=2, sticky="ns")
+        self._vs.grid(row=0, column=2, sticky="ns")
         hs.grid(row=1, column=1, sticky="ew")
         self.rowconfigure(0, weight=1)
         self.columnconfigure(1, weight=1)
-        for tag in ("key", "string", "number", "boolean", "null", "punct", "errline"):
+        for tag in ("key", "string", "number", "boolean", "null", "punct",
+                    "errline", "curline", "bmatch", "bunmatch"):
             self.text.tag_configure(tag)
         self.text.bind("<<Modified>>", self._on_modified)
         self.text.bind("<Configure>", lambda e: self._draw_linenums())
+        # V1.1：离开编辑区立即解析（>8MB 暂停实时解析时的显式时机）
+        self.text.bind("<FocusOut>",
+                       lambda e: self.app._flush_text_parse())
+        # V1.1.1：进入文本区前先落盘 Tree 编辑产生的待重建 Text（大文件防抖合并）
+        self.text.bind("<FocusIn>",
+                       lambda e: self.app._flush_text_rebuild())
+        # V1.1：光标移动 → 当前行高亮 / 括号匹配 / 状态栏 Ln·Col
+        self.text.bind("<KeyRelease>", self._on_cursor_moved)
+        self.text.bind("<ButtonRelease-1>", self._on_cursor_moved)
+        self._last_curline: Optional[str] = None
+        self._big_text = False
+        self._line_h: Optional[int] = None
+        self._hl_range: Optional[Tuple[int, int]] = None  # 最近一次高亮的可视行范围
+        self._skip_modified = False   # set_text 程序回写时抑制 on_text_changed
 
     def set_text(self, s: str) -> None:
         yview = self.text.yview()
         self.text.delete("1.0", "end")
         self.text.insert("1.0", s)
         self.text.edit_modified(False)
+        self._skip_modified = True   # 本次 insert 引发的 <<Modified>> 不触发解析调度
+        self._big_text = len(s) > HIGHLIGHT_LIMIT
+        self._last_curline = None
+        self._hl_range = None
         self._schedule_highlight()
         self.text.yview_moveto(yview[0])
         self.after_idle(self._draw_linenums)
+        self.after_idle(self._update_curline)
 
     def get_text(self) -> str:
         return self.text.get("1.0", "end-1c")
 
     def _on_modified(self, _event=None) -> None:
         self.text.edit_modified(False)
+        skip = self._skip_modified
+        self._skip_modified = False
         self._schedule_highlight()
         self._draw_linenums()
-        self.app.on_text_changed()
+        self._big_text = self._text_len() > HIGHLIGHT_LIMIT
+        self._update_curline()
+        if not skip:   # 程序回写（set_text）引发的 Modified：已同步，不重复解析
+            self.app.on_text_changed()
 
     def _schedule_highlight(self) -> None:
         if self._hl_job:
             self.after_cancel(self._hl_job)
         self._hl_job = self.after(200, self._highlight)
 
+    def _on_vscroll(self, *args: Any) -> None:
+        """纵向滚动 → 同步滚动条并防抖重亮可视区（增量高亮）。"""
+        self._vs.set(*args)
+        self._schedule_highlight()
+
     def _highlight(self) -> None:
+        """可视区语法高亮：只高亮可见行（±3 行缓冲），滚动时增量重亮。
+
+        整文档一次性 tag_add 在 1MB+ 文本上会让 Tk 重写大范围 tag 结构
+        （实测 >12s，主线程假死）。按视口行范围切片后开销只与视口相关，
+        无论文档多大单次高亮均为毫秒级。"""
         self._hl_job = None
         t = self.text
-        for tag in ("key", "string", "number", "boolean", "null", "punct"):
-            t.tag_remove(tag, "1.0", "end")
-        content = t.get("1.0", "end-1c")
-        if not content or len(content) > HIGHLIGHT_LIMIT:
-            return  # 超大文本跳过高亮，保证滚动流畅
-        n = len(content)
-        for m in _TOKEN_RE.finditer(content):
+        hl_tags = ("key", "string", "number", "boolean", "null", "punct")
+        try:
+            height = max(t.winfo_height(), 1)
+            first = int(t.index("@0,0").split(".")[0])
+            last = int(t.index("@0,%d" % height).split(".")[0]) + 3
+        except tk.TclError:
+            return
+        try:
+            total = int(t.index("end-1c").split(".")[0])
+        except tk.TclError:
+            return
+        if total <= 0:
+            return
+        last = min(last, total + 1)
+        if last - first <= 1:
+            # 压缩视图/单行超长：跳过高亮，避免 Tk 对超长行做 tag 布局
+            return
+        # 只清理上一次高亮过的区域（避免对整文档 tag_remove）
+        if self._hl_range:
+            a, b = self._hl_range
+            for tag in hl_tags:
+                t.tag_remove(tag, "%d.0" % a, "%d.0" % b)
+        self._hl_range = (first, last)
+        seg = t.get("%d.0" % first, "%d.0" % last)
+        if not seg:
+            return
+        n = len(seg)
+        ranges: dict = {k: [] for k in hl_tags}
+        for m in _TOKEN_RE.finditer(seg):
             tok = m.group()
             c = tok[0]
             if c == '"':
                 j = m.end()
-                while j < n and content[j] in " \t\r\n":
+                while j < n and seg[j] in " \t\r\n":
                     j += 1
-                tag = "key" if j < n and content[j] == ":" else "string"
-            elif c in "{}[]:,":
+                tag = "key" if j < n and seg[j] == ":" else "string"
+            elif c in "(){}[]:,":
                 tag = "punct"
             elif tok in ("true", "false"):
                 tag = "boolean"
@@ -1244,7 +1354,113 @@ class TextPane(ttk.Frame):
                 tag = "null"
             else:
                 tag = "number"
-            t.tag_add(tag, "1.0+%dc" % m.start(), "1.0+%dc" % m.end())
+            # Tk "+Nc" 是游标式字符前移，跨行自动；以可视首行为基准即可
+            ranges[tag].extend(("%d.0+%dc" % (first, m.start()),
+                                "%d.0+%dc" % (first, m.end())))
+        for tag, rs in ranges.items():
+            for i in range(0, len(rs), 10000):
+                t.tag_add(tag, *rs[i:i + 10000])
+
+    def _text_len(self) -> int:
+        """文本字符数（Tk count，兼容 macOS Tk 返回值差异）。"""
+        try:
+            return int(self.tk.call(self.text._w, "count", "-chars",
+                                    "1.0", "end-1c"))
+        except tk.TclError:
+            return 0
+
+    def _on_cursor_moved(self, _e=None) -> None:
+        """V1.1：光标移动后刷新当前行高亮、括号匹配与状态栏 Ln·Col。"""
+        self._update_curline()
+        self._update_bracket_match()
+        self.app._update_cursor_pos()
+
+    def _update_curline(self) -> None:
+        """当前行背景高亮：行号变化才重绘，避免全文本重扫。"""
+        t = self.text
+        try:
+            line = t.index("insert").split(".")[0]
+        except tk.TclError:
+            return
+        if line == self._last_curline:
+            return
+        self._last_curline = line
+        t.tag_remove("curline", "1.0", "end")
+        t.tag_add("curline", "%s.0" % line, "%s.end" % line)
+        t.tag_lower("curline")  # 保持在底层，不压过语法高亮/错误行
+
+    def _update_bracket_match(self) -> None:
+        """括号匹配：光标前一字符为括号时，在视口内 token 级配平扫描。
+        >4MB 大文件跳过（与语法高亮边界一致）。"""
+        t = self.text
+        t.tag_remove("bmatch", "1.0", "end")
+        t.tag_remove("bunmatch", "1.0", "end")
+        if self._big_text:
+            return
+        try:
+            pos = t.index("insert")
+            if pos == "1.0":
+                return
+            # 光标所在行超长（压缩视图单行）：跳过，避免对超长行做 token 扫描
+            if len(t.get(pos.split(".")[0] + ".0",
+                         pos.split(".")[0] + ".end")) > MAX_HL_LINE:
+                return
+            prev = t.index("%s -1c" % pos)
+        except tk.TclError:
+            return
+        ch = t.get(prev, pos)
+        if ch not in "()[]{}":
+            return
+        if "string" in t.tag_names(prev):  # 括号位于字符串/键内，不匹配
+            return
+        w, h = max(t.winfo_width(), 1), max(t.winfo_height(), 1)
+        top = t.index("@0,0")
+        bot = t.index("@%d,%d lineend" % (w, h))
+        # 光标在视口外（滚动后）：不在屏幕外寻找匹配
+        if t.compare(prev, "<", top) or t.compare(prev, ">", bot):
+            return
+        if ch in "([{":
+            m = self._match_bracket(t.get(prev, bot), ch, prev, forward=True)
+        else:
+            m = self._match_bracket(t.get(top, prev), ch, top, forward=False)
+        if m is None:
+            t.tag_add("bunmatch", prev, pos)
+            return
+        t.tag_add("bmatch", prev, pos)
+        t.tag_add("bmatch", m, "%s+1c" % m)
+
+    @staticmethod
+    def _punct_tokens(text: str) -> list:
+        """提取文本中的独立括号 token（(token, 偏移)，字符串内容天然排除）。"""
+        return [(m.group(), m.start())
+                for m in _TOKEN_RE.finditer(text) if m.group() in "()[]{}"]
+
+    @staticmethod
+    def _match_bracket(text: str, ch: str, base: str,
+                       forward: bool) -> Optional[str]:
+        """在 text 中配平括号，返回匹配位置的绝对索引；无匹配返回 None。
+        forward=True：text 以 ch 开头向后找闭合；否则从右往左找配对。"""
+        if forward:
+            open_c, close_c = ch, {"(": ")", "[": "]", "{": "}"}[ch]
+            depth = 0
+            for tok, off in TextPane._punct_tokens(text):
+                if tok == open_c:
+                    depth += 1
+                elif tok == close_c:
+                    depth -= 1
+                    if depth == 0:
+                        return "%s+%dc" % (base, off)
+        else:
+            open_c, close_c = {")": "(", "]": "[", "}": "{"}[ch], ch
+            depth = 1  # ch 自身需要一个配对开括号
+            for tok, off in reversed(TextPane._punct_tokens(text)):
+                if tok == close_c:
+                    depth += 1
+                elif tok == open_c:
+                    depth -= 1
+                    if depth == 0:
+                        return "%s+%dc" % (base, off)
+        return None
 
     def _draw_linenums(self) -> None:
         c = self.linenums
@@ -1255,13 +1471,24 @@ class TextPane(ttk.Frame):
             return
         first = int(t.index("@0,0").split(".")[0])
         last = first + int(t.winfo_height() // 20) + 2
+        # V1.1：行高缓存（首次 bbox 一次，此后按固定行距绘制）。
+        # 避免对超长单行反复调用 bbox——Tk 需布局整行，可致数百毫秒卡顿
+        if self._line_h is None:
+            # 超长行（压缩视图单行）不做 bbox——Tk 需布局整行，可致数百毫秒卡顿
+            if len(t.get("%d.0" % first, "%d.end" % first)) > MAX_HL_LINE:
+                self._line_h = 20
+            else:
+                bb = t.bbox("%d.0" % first)
+                if not bb:
+                    return
+                self._line_h = bb[3]
+        y = 1
         i = first
         while i <= min(total, last):
-            bb = t.bbox("%d.0" % i)
-            if bb:
-                c.create_text(46, bb[1] + bb[3] // 2 - 1, text=str(i),
-                              anchor="e", font=(MONO_FONT, 11))
+            c.create_text(46, y + self._line_h // 2 - 1, text=str(i),
+                          anchor="e", font=(MONO_FONT, 11))
             i += 1
+            y += self._line_h
 
     def mark_error(self, line: int, col: int) -> None:
         self.text.tag_remove("errline", "1.0", "end")
@@ -1284,13 +1511,17 @@ class TextPane(ttk.Frame):
         self.text.tag_configure("null", foreground=th["null"])
         self.text.tag_configure("punct", foreground=th["punct"])
         self.text.tag_configure("errline", background=th["error"])
+        self.text.tag_configure("curline", background=th["curline"])
+        self.text.tag_configure("bmatch", background=th["select_bg"])
+        self.text.tag_configure("bunmatch", background=th["error"])
 
 
 # ---------------------------------------------------------------------------
 # TreePane —— 结构树（惰性加载 / 就地编辑 / 右键操作）
 # ---------------------------------------------------------------------------
 
-PH_SUFFIX = "__ph__"  # 占位子节点 iid 后缀
+PH_SUFFIX = "__ph__"  # 懒加载占位子节点 iid 后缀
+PG_SUFFIX = "__pg__"  # 分页占位 iid 后缀（超大子集合：双击加载更多）
 
 
 class TreePane(ttk.Frame):
@@ -1316,7 +1547,6 @@ class TreePane(ttk.Frame):
 
         self._editor: Optional[tk.Entry] = None
         self._edit_target: Optional[Tuple[str, str]] = None
-        self._pop_gen = 0
 
         self.tree.bind("<<TreeviewOpen>>", self._on_open)
         self.tree.bind("<<TreeviewClose>>", self._on_close)
@@ -1326,13 +1556,17 @@ class TreePane(ttk.Frame):
         self.tree.bind("<Button-2>", self._on_menu)
         self.tree.bind("<Configure>", self._on_resize)
         self.tree.bind("<MouseWheel>", self._on_resize)
+        self.tree.bind("<Motion>", self._on_motion)          # V1.1 Tooltip
+        self.tree.bind("<Leave>", lambda e: self._hide_tooltip())
+        self._tip: Optional[tk.Toplevel] = None
+        self._tip_item: Optional[str] = None
+        self._tip_col: Optional[str] = None
         self.menu = self._build_menu()
 
     # -- 构建 / 重建 -----------------------------------------------------------
 
     def rebuild(self) -> None:
         """全量重建可见树。惰性：只实例化 open_paths 中已展开的分支。"""
-        self._pop_gen += 1
         self._cancel_edit()
         t = self.tree
         t.delete(*t.get_children(""))
@@ -1343,8 +1577,8 @@ class TreePane(ttk.Frame):
                                       or () in app.open_paths)
         t.insert("", "end", iid=path_to_iid(()), text="root", open=root_open,
                  values=(type_name(root_obj),
-                         "" if is_container else
-                         scalar_label(root_obj, app.show_quotes)))
+                         self._row_display(root_obj, app.show_quotes)),
+                 tags=("t_" + type_name(root_obj),))
         if is_container:
             self._insert_children((), path_to_iid(()))
 
@@ -1354,24 +1588,30 @@ class TreePane(ttk.Frame):
             obj = app.model.get_by_path(path)
         except (KeyError, IndexError):
             return
-        children = self._children_of(path, obj)
         t = self.tree
         if app.filter_paths is not None:
-            kept = False
-            for cp, _lbl in children:
-                if cp in app.filter_paths:
-                    self._insert_node(cp, parent_iid)
-                    kept = True
-            if kept:
-                t.item(parent_iid, open=True)
-        elif path in app.open_paths:
-            for cp, _lbl in children:
-                self._insert_node(cp, parent_iid)
+            # 过滤模式：可见性本就基于全量计算，可接受 O(N) 遍历
+            children = self._children_of(path, obj)
+            matched = [c for c in children if c[0] in app.filter_paths]
+            if not matched:
+                return
             t.item(parent_iid, open=True)
-        elif children:
+            self._insert_page(path, parent_iid, matched, 0, len(matched))
+        elif path in app.open_paths:
+            total = self._child_count(obj)
+            if total > TREE_PAGE_SIZE:
+                # 超大子集合：只实例化一页 + 分页占位（V1.1.1）
+                self._insert_page(path, parent_iid,
+                                  self._iter_children(path, obj), 0, total)
+            else:
+                for cp, _lbl in self._iter_children(path, obj):
+                    self._insert_node(cp, parent_iid)
+                t.item(parent_iid, open=True)
+        elif self._child_count(obj):
             self._insert_placeholder(parent_iid)
 
     def _children_of(self, path: Path, obj: Any) -> List[Tuple[Path, str]]:
+        """一次性构建全部子节点（仅过滤等本就全量的场景使用）。"""
         out: List[Tuple[Path, str]] = []
         if isinstance(obj, dict):
             for k in obj.keys():
@@ -1380,6 +1620,46 @@ class TreePane(ttk.Frame):
             for i in range(len(obj)):
                 out.append((path + (i,), "[%d]" % i))
         return out
+
+    def _child_count(self, obj: Any) -> int:
+        """容器子项数（O(1)，不构造任何 Path）。"""
+        if isinstance(obj, dict):
+            return len(obj)
+        if isinstance(obj, list):
+            return len(obj)
+        return 0
+
+    def _iter_children(self, path: Path, obj: Any) -> Iterator[Tuple[Path, str]]:
+        """流式生成子节点 (Path, label)（V1.1.1）：只生成需要的部分，
+        绝不一次性构造全部 Path——打开 5 万子项只需前 2000 个 Path。"""
+        if isinstance(obj, dict):
+            for k in obj.keys():
+                yield (path + (k,), str(k))
+        elif isinstance(obj, list):
+            for i in range(len(obj)):
+                yield (path + (i,), "[%d]" % i)
+
+    def _row_display(self, obj: Any, show_quotes: bool) -> str:
+        """行值显示：容器显示计数 {n}/[n]（V1.1 视觉层级），字符串截断 80（hover 看完整）。"""
+        if isinstance(obj, dict):
+            return "{%d}" % len(obj)
+        if isinstance(obj, list):
+            return "[%d]" % len(obj)
+        return scalar_label(obj, show_quotes, 80)
+
+    def _update_parent_count(self, parent_path: Path) -> None:
+        """局部增删后刷新父容器行的计数显示（object {n} / array [n]）。"""
+        piid = path_to_iid(parent_path)
+        t = self.tree
+        if not t.exists(piid):
+            return
+        try:
+            parent = self.app.model.get_by_path(parent_path)
+        except (KeyError, IndexError):
+            return
+        if isinstance(parent, (dict, list)):
+            t.item(piid, values=(type_name(parent),
+                                 self._row_display(parent, self.app.show_quotes)))
 
     def _insert_node(self, path: Path, parent_iid: str) -> None:
         app = self.app
@@ -1390,14 +1670,14 @@ class TreePane(ttk.Frame):
         t = self.tree
         seg = path[-1]
         label = "[%d]" % seg if isinstance(seg, int) else str(seg)
-        container = isinstance(obj, (dict, list))
-        val = "" if container else scalar_label(obj, app.show_quotes)
+        tn = type_name(obj)
         try:
             t.insert(parent_iid, "end", iid=path_to_iid(path), text=label,
-                     values=(type_name(obj), val), open=False)
+                     values=(tn, self._row_display(obj, app.show_quotes)),
+                     tags=("t_" + tn,), open=False)
         except tk.TclError:
             return
-        if container:
+        if isinstance(obj, (dict, list)):
             self._insert_children(path, path_to_iid(path))
 
     def _insert_placeholder(self, parent_iid: str) -> None:
@@ -1407,11 +1687,176 @@ class TreePane(ttk.Frame):
         except tk.TclError:
             pass
 
+    # -- 分页虚拟化（V1.1.1：超大子集合只实例化一页 + 「双击加载更多」占位） --------
+
+    def _has_page(self, piid: str) -> bool:
+        """父行下是否存在分页占位（子项被截断未完全实例化）。"""
+        return any(PG_SUFFIX in c for c in self.tree.get_children(piid))
+
+    def _insert_page(self, path: Path, parent_iid: str, children: Any,
+                     start: int, total: int) -> None:
+        """插入 children[start:start+TREE_PAGE_SIZE]（children 可为 list 或生成器），
+        仍有剩余则补分页占位行。生成器路径不会构造整页之外的任何 Path。"""
+        t = self.tree
+        end = min(start + TREE_PAGE_SIZE, total)
+        for cp, _lbl in itertools.islice(children, start, end):
+            if not t.exists(path_to_iid(cp)):
+                self._insert_node(cp, parent_iid)
+        if end < total:
+            self._insert_page_row(path, parent_iid, end, total)
+        t.item(parent_iid, open=True)
+
+    def _insert_page_row(self, path: Path, parent_iid: str,
+                         next_start: int, total: int) -> None:
+        try:
+            self.tree.insert(parent_iid, "end",
+                             iid=path_to_iid(path) + PG_SUFFIX + str(next_start),
+                             text="⋯",
+                             values=("", "还有 %d 项 · 双击加载更多" % (total - next_start)),
+                             tags=("t_page",))
+        except tk.TclError:
+            pass
+
+    def _load_more(self, page_iid: str) -> None:
+        """双击分页占位：删除占位、插入下一页，仍超则再补占位。"""
+        base, _, page = page_iid.rpartition(PG_SUFFIX)
+        t = self.tree
+        if not t.exists(page_iid):
+            return
+        path = iid_to_path(base)
+        item = path_to_iid(path)
+        t.delete(page_iid)
+        try:
+            obj = self.app.model.get_by_path(path)
+        except (KeyError, IndexError):
+            return
+        total = self._child_count(obj)
+        start = int(page)
+        end = min(start + TREE_PAGE_SIZE, total)
+        for cp, _lbl in itertools.islice(self._iter_children(path, obj),
+                                         start, end):
+            if not t.exists(path_to_iid(cp)):
+                self._insert_node(cp, item)
+        if end < total:
+            self._insert_page_row(path, item, end, total)
+        self.app.set_status("ok", "已加载 %d/%d 项" % (end, total))
+
+    # -- 局部刷新（V1.1：单节点修改不重建整棵可见投影） ---------------------------
+
+    def refresh_path(self, path: Path) -> None:
+        """单行局部更新（改值/改名）。iid 未实例化（惰性未展开）则跳过。"""
+        iid = path_to_iid(path)
+        t = self.tree
+        if not t.exists(iid):
+            return
+        app = self.app
+        try:
+            obj = app.model.get_by_path(path)
+        except (KeyError, IndexError):
+            return
+        seg = path[-1]
+        label = "[%d]" % seg if isinstance(seg, int) else str(seg)
+        tn = type_name(obj)
+        t.item(iid, text=label,
+               values=(tn, self._row_display(obj, app.show_quotes)),
+               tags=("t_" + tn,))
+
+    def _refresh_parent_children(self, parent_path: Path) -> None:
+        """局部重建父节点下的直接子行（Rename / list 的增删移用），
+        保持父 item 自身与展开态；父未实例化则跳过。"""
+        piid = path_to_iid(parent_path)
+        t = self.tree
+        if not t.exists(piid):
+            return
+        for child in t.get_children(piid):
+            t.delete(child)
+        self._insert_children(parent_path, piid)
+
+    def refresh_insert(self, parent_path: Path) -> None:
+        """父节点已实例化时局部插入。list 父（下标级联）→ 重建父子行；
+        dict 父 → 单行追加（新键在末尾）。"""
+        piid = path_to_iid(parent_path)
+        t = self.tree
+        if not t.exists(piid):
+            return
+        app = self.app
+        try:
+            parent = app.model.get_by_path(parent_path)
+        except (KeyError, IndexError):
+            return
+        if isinstance(parent, list):
+            self._refresh_parent_children(parent_path)
+            return
+        children = self._children_of(parent_path, parent)
+        if not children:
+            return
+        if self._has_page(piid):
+            self._refresh_parent_children(parent_path)  # 分页截断 → 重建父行
+            return
+        new_path = children[-1][0]  # dict 新增键必然在末尾
+        if t.item(piid, "open"):
+            self._insert_node(new_path, piid)
+        elif not t.get_children(piid):
+            self._insert_placeholder(piid)
+        self._update_parent_count(parent_path)
+
+    def refresh_delete(self, parent_path: Path, child_path: Path) -> None:
+        """删除单行（dict 无下标级联）；list 父 → 重建父子行；占位随孩子有无增删。"""
+        piid = path_to_iid(parent_path)
+        t = self.tree
+        if not t.exists(piid):
+            return
+        app = self.app
+        try:
+            parent = app.model.get_by_path(parent_path)
+        except (KeyError, IndexError):
+            return
+        if isinstance(parent, list):
+            self._refresh_parent_children(parent_path)
+            return
+        if self._has_page(piid):
+            self._refresh_parent_children(parent_path)  # 分页截断 → 重建父行
+            return
+        iid = path_to_iid(child_path)
+        if t.exists(iid):
+            t.delete(iid)
+        ph = piid + PH_SUFFIX
+        if t.exists(ph):
+            if not parent:
+                t.delete(ph)  # 删空 → 移除占位
+        elif parent and not t.get_children(piid):
+            self._insert_placeholder(piid)  # 未展开且仍有孩子 → 补占位
+        self._update_parent_count(parent_path)
+
+    def refresh_move(self, path: Path, delta: int) -> None:
+        """相邻元素移动局部刷新。两 iid 均已实例化且无子 item → 局部重插；
+        否则重建父子行。选中跟随移动后的目标位置（V1.1：不丢选中/滚动）。"""
+        parent = path[:-1]
+        piid = path_to_iid(parent)
+        t = self.tree
+        if not t.exists(piid):
+            return
+        j = path[-1] + delta
+        iid = path_to_iid(path)
+        nid = path_to_iid(parent + (j,))
+        if (t.exists(iid) and t.exists(nid)
+                and not t.get_children(iid) and not t.get_children(nid)):
+            t.delete(iid, nid)
+            for k in sorted((path[-1], j)):
+                self._insert_node(parent + (k,), piid)
+        else:
+            self._refresh_parent_children(parent)
+        sel = path_to_iid(parent + (j,))
+        if t.exists(sel):
+            t.selection_set(sel)
+            t.focus(sel)
+            t.see(sel)
+
     # -- 惰性加载 ---------------------------------------------------------------
 
     def _on_open(self, _event=None) -> None:
         item = self.tree.focus()
-        if not item or item.endswith(PH_SUFFIX):
+        if not item or item.endswith(PH_SUFFIX) or PG_SUFFIX in item:
             return
         self.app.open_paths.add(iid_to_path(item))
         self._populate(item)
@@ -1422,7 +1867,7 @@ class TreePane(ttk.Frame):
             self.app.open_paths.discard(iid_to_path(item))
 
     def _populate(self, item: str) -> None:
-        """首次展开：删除占位，分批插入真实子节点。"""
+        """首次展开：删除占位，按分页插入真实子节点（超大集合截断一页）。"""
         ph = item + PH_SUFFIX
         if self.tree.exists(ph):
             self.tree.delete(ph)
@@ -1431,22 +1876,8 @@ class TreePane(ttk.Frame):
             obj = self.app.model.get_by_path(path)
         except (KeyError, IndexError):
             return
-        children = self._children_of(path, obj)
-        self._batch_insert(item, children, 0, self._pop_gen)
-
-    def _batch_insert(self, item: str, children: List[Tuple[Path, str]],
-                      start: int, gen: int) -> None:
-        if gen != self._pop_gen or not self.tree.exists(item):
-            return
-        end = min(start + LAZY_BATCH, len(children))
-        for i in range(start, end):
-            cp, _lbl = children[i]
-            if not self.tree.exists(path_to_iid(cp)):
-                self._insert_node(cp, item)
-        if end < len(children):
-            self.after(1, lambda: self._batch_insert(item, children, end, gen))
-            if end >= LAZY_BATCH:
-                self.app.set_status("info", "正在加载 %d/%d …" % (end, len(children)))
+        total = self._child_count(obj)
+        self._insert_page(path, item, self._iter_children(path, obj), 0, total)
 
     # -- 就地编辑 -----------------------------------------------------------------
 
@@ -1454,18 +1885,21 @@ class TreePane(ttk.Frame):
         item = self.tree.identify_row(event.y)
         if not item:
             return ""
+        if PG_SUFFIX in item:
+            self._load_more(item)
+            return "break"
         col = self.tree.identify_column(event.x)
         self._start_edit(item, col)
         return "break"
 
     def _on_return(self, _event) -> str:
         item = self.tree.focus()
-        if item and not item.endswith(PH_SUFFIX):
+        if item and not item.endswith(PH_SUFFIX) and PG_SUFFIX not in item:
             self._start_edit(item, "#2")
         return "break"
 
     def _start_edit(self, item: str, col: str) -> None:
-        if self._editor or item.endswith(PH_SUFFIX):
+        if self._editor or item.endswith(PH_SUFFIX) or PG_SUFFIX in item:
             return
         app = self.app
         path = iid_to_path(item)
@@ -1570,11 +2004,60 @@ class TreePane(ttk.Frame):
         m.add_separator()
         m.add_command(label="上移", command=lambda: self.app.on_move(-1))
         m.add_command(label="下移", command=lambda: self.app.on_move(1))
+        m.add_separator()
+        m.add_command(label="复制路径", command=self._copy_path)
+        m.add_command(label="复制值", command=self._copy_value)
+        m.add_command(label="复制 JSON", command=self._copy_json)
         return m
+
+    def _sel_path(self) -> Optional[Path]:
+        sel = self.tree.selection()
+        if not sel:
+            return None
+        if PH_SUFFIX in sel[0] or PG_SUFFIX in sel[0]:
+            return None
+        return iid_to_path(sel[0])
+
+    def _copy_path(self) -> None:
+        path = self._sel_path()
+        if path is None:
+            return
+        text = format_path(path)  # JSONPath 风格：$.users[3].address.city
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        self.app.set_status("ok", "已复制路径 %s" % text)
+
+    def _copy_value(self) -> None:
+        """复制原始值文本：字符串节点不带引号，其他为 JSON 字面量。"""
+        path = self._sel_path()
+        if path is None:
+            return
+        try:
+            obj = self.app.model.get_by_path(path)
+        except (KeyError, IndexError):
+            return
+        text = obj if isinstance(obj, str) else json.dumps(obj, ensure_ascii=False)
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        self.app.set_status("ok", "已复制值")
+
+    def _copy_json(self) -> None:
+        """复制 JSON 字面量：字符串带引号（"Alice"），可粘贴回编辑区。"""
+        path = self._sel_path()
+        if path is None:
+            return
+        try:
+            obj = self.app.model.get_by_path(path)
+        except (KeyError, IndexError):
+            return
+        text = json.dumps(obj, ensure_ascii=False)
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        self.app.set_status("ok", "已复制 JSON")
 
     def _on_menu(self, event) -> str:
         item = self.tree.identify_row(event.y)
-        if item and not item.endswith(PH_SUFFIX):
+        if item and not item.endswith(PH_SUFFIX) and PG_SUFFIX not in item:
             self.tree.selection_set(item)
             self.tree.focus(item)
             try:
@@ -1582,6 +2065,57 @@ class TreePane(ttk.Frame):
             finally:
                 self.menu.grab_release()
         return "break"
+
+    def _on_motion(self, event) -> Optional[str]:
+        """V1.1 Tooltip：hover 显示被截断的完整值（节流：命中不变不重建；大文档禁用）。"""
+        if (self.app._node_count or 0) > 200_000:
+            return None
+        item = self.tree.identify_row(event.y)
+        col = self.tree.identify_column(event.x)
+        if (item, col) == (self._tip_item, self._tip_col):
+            if self._tip is not None:
+                self._tip.geometry("+%d+%d" % (event.x_root + 14,
+                                               event.y_root + 16))
+            return None
+        self._hide_tooltip()
+        self._tip_item, self._tip_col = item, col
+        if not item or item.endswith(PH_SUFFIX) or col != "#3":
+            return None
+        path = iid_to_path(item)
+        if path is None:
+            return None
+        try:
+            obj = self.app.model.get_by_path(path)
+        except (KeyError, IndexError):
+            return None
+        if isinstance(obj, (dict, list)):
+            return None  # 容器显示计数，无需 tooltip
+        shown = self.tree.item(item, "values")
+        if not shown or not str(shown[1]).endswith("…"):
+            return None  # 未截断不显示
+        full = scalar_label(obj, self.app.show_quotes, 10 ** 9)
+        th = THEMES[self.app.theme_name]
+        tip = tk.Toplevel(self)
+        tip.withdraw()
+        tip.overrideredirect(True)
+        tip.attributes("-topmost", True)
+        tk.Label(tip, text=full, background=th["field"], foreground=th["fg"],
+                 relief="solid", bd=1, padx=7, pady=4, font=(UI_FONT, 11),
+                 wraplength=520).pack()
+        tip.deiconify()
+        tip.geometry("+%d+%d" % (event.x_root + 14, event.y_root + 16))
+        self._tip = tip
+        return None
+
+    def _hide_tooltip(self) -> None:
+        if self._tip is not None:
+            try:
+                self._tip.destroy()
+            except tk.TclError:
+                pass
+            self._tip = None
+        self._tip_item = None
+        self._tip_col = None
 
     def apply_theme(self, th: dict) -> None:
         style = ttk.Style(self)
@@ -1593,6 +2127,19 @@ class TreePane(ttk.Frame):
         style.map("Treeview",
                   background=[("selected", th["select_bg"])],
                   foreground=[("selected", th["fg"])])
+        # V1.1：类型语义色（仅列前景色，轻微提示，不整行染色）
+        for tn, color in (("object", th["muted"]), ("array", th["muted"]),
+                          ("string", th["string"]), ("number", th["number"]),
+                          ("integer", th["number"]), ("boolean", th["boolean"]),
+                          ("null", th["null"])):
+            try:
+                self.tree.tag_configure("t_" + tn, foreground=color)
+            except tk.TclError:
+                pass
+        try:
+            self.tree.tag_configure("t_page", foreground=th["muted"])
+        except tk.TclError:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -1620,9 +2167,9 @@ class SearchPanel(ttk.Frame):
         ent.bind("<Return>", lambda e: self.goto(1))
         ent.bind("<Shift-Return>", lambda e: self.goto(-1))
         ent.bind("<KeyRelease>", self._on_query_changed)
-        ttk.Button(row1, text="▲ 上一个", width=9,
+        ttk.Button(row1, text="↑", width=3,
                    command=lambda: self.goto(-1)).pack(side="left")
-        ttk.Button(row1, text="▼ 下一个", width=9,
+        ttk.Button(row1, text="↓", width=3,
                    command=lambda: self.goto(1)).pack(side="left")
         self.count_label = ttk.Label(row1, text="0/0", width=10)
         self.count_label.pack(side="left", padx=6)
@@ -1837,7 +2384,7 @@ class SearchPanel(ttk.Frame):
 class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title(APP_NAME)
+        self.title("%s %s" % (APP_NAME, APP_VERSION))
         self.geometry("1200x760")
         self.minsize(860, 560)
 
@@ -1857,8 +2404,14 @@ class App(tk.Tk):
         self._saved_format: Tuple[bool, Any] = (True, 4)  # 磁盘上的格式
         self._from_tree = False
         self._text_job: Optional[str] = None
+        self._pending_parse = False             # >8MB：暂停实时解析，待显式时机 commit
         self._text_txn_open = False             # Q2：文本事务开关
         self._last_synced_text: Optional[str] = None
+        self._text_rebuild_job: Optional[str] = None  # V1.1.1：大文件 Text 重建防抖
+        self._pending_text: Optional[str] = None      # 待落盘的 Text 内容（>1MB 合并）
+        self._text_stale = False                      # 大文件：Text 已过期待重建
+        self._big_text_rebuild = False                # 当前文档是否启用 Text 重建防抖
+        self._text_dirty = False                      # 用户是否编辑过文本（免读 6MB 全文比较）
         self._saved_stat: Optional[Tuple[float, int]] = None
         self._status_job: Optional[str] = None
 
@@ -1941,28 +2494,55 @@ class App(tk.Tk):
 
         m_help = tk.Menu(mb, tearoff=0)
         m_help.add_command(label="快捷键说明", command=self._show_help)
+        m_help.add_separator()
+        m_help.add_command(label="关于 %s" % APP_NAME, command=self._show_about)
         mb.add_cascade(label="帮助", menu=m_help)
         self.config(menu=mb)
 
     def _build_toolbar(self) -> None:
+        """V1.1：工具栏按组分区（文件 | 撤销重做 | 格式化▼ | 展开▼ | 查找）。"""
         tb = ttk.Frame(self, padding=(6, 4))
         self.toolbar = tb
-        for text, cmd in (("打开", self.open_file_dialog), ("保存", self.save_file),
-                          ("格式化", lambda: self.do_format(True)),
-                          ("压缩", lambda: self.do_format(False)),
-                          ("全部展开", self.expand_all),
-                          ("全部收缩", self.collapse_all),
-                          ("查找", self.show_search),
-                          ("撤销", self.do_undo), ("重做", self.do_redo)):
+
+        def sep():
+            ttk.Separator(tb, orient="vertical").pack(side="left", fill="y", padx=7)
+
+        for text, cmd in (("打开", self.open_file_dialog), ("保存", self.save_file)):
             ttk.Button(tb, text=text, command=cmd,
-                       padding=(8, 2)).pack(side="left", padx=3)
+                       padding=(8, 2)).pack(side="left", padx=2)
+        sep()
+        for text, cmd in (("撤销", self.do_undo), ("重做", self.do_redo)):
+            ttk.Button(tb, text=text, command=cmd,
+                       padding=(8, 2)).pack(side="left", padx=2)
+        sep()
+        fmt = ttk.Menubutton(tb, text="格式化 ▾")
+        fmt_menu = tk.Menu(fmt, tearoff=0)
+        fmt_menu.add_command(label="美化", command=lambda: self.do_format(True))
+        fmt_menu.add_command(label="压缩", command=lambda: self.do_format(False))
+        fmt.configure(menu=fmt_menu)
+        fmt.pack(side="left", padx=2)
+        exp = ttk.Menubutton(tb, text="展开 ▾")
+        exp_menu = tk.Menu(exp, tearoff=0)
+        exp_menu.add_command(label="全部展开", command=self.expand_all)
+        exp_menu.add_command(label="全部收缩", command=self.collapse_all)
+        exp_menu.add_separator()
+        exp_menu.add_checkbutton(label="显示字符串引号",
+                                 variable=self._quotes_var,
+                                 command=self.toggle_quotes)
+        exp.configure(menu=exp_menu)
+        exp.pack(side="left", padx=2)
+        sep()
+        ttk.Button(tb, text="查找", command=self.show_search,
+                   padding=(8, 2)).pack(side="left", padx=2)
 
     def _build_statusbar(self) -> None:
         self.statusbar = ttk.Frame(self, padding=(8, 3))
         self.st_left = ttk.Label(self.statusbar, text="未命名", anchor="w")
+        self.st_pos = ttk.Label(self.statusbar, text="", anchor="w")  # Ln/Col
         self.st_mid = ttk.Label(self.statusbar, text="", anchor="w")
         self.st_right = ttk.Label(self.statusbar, text="", anchor="e")
         self.st_left.pack(side="left", fill="x", expand=True)
+        self.st_pos.pack(side="left", padx=12)
         self.st_mid.pack(side="left", padx=12)
         self.st_right.pack(side="right")
 
@@ -1988,6 +2568,8 @@ class App(tk.Tk):
         bind(["<%s-E>" % mod], lambda e: (self.expand_all(), "break")[1])
         bind(["<%s-K>" % mod], lambda e: (self.collapse_all(), "break")[1])
         bind(["<%s-Q>" % mod], lambda e: (self.toggle_quotes(), "break")[1])
+        bind(["<%s-Return>" % mod],  # Ctrl/Cmd+Enter：大文件下立即解析
+             lambda e: (self._flush_text_parse(), "break")[1])
         bind(["<Escape>"], self._key_escape)
 
         # 树导航键必须绑定在 Treeview 自身（widget bindtag 先于 class 执行）并
@@ -2037,10 +2619,7 @@ class App(tk.Tk):
     def show_search(self) -> None:
         # P0：搜索基于权威 Model，先 flush pending 草稿保证结果与所见一致
         # （非法 Draft 不拦截——搜索照常基于最后有效数据）
-        if self._text_job:
-            self.after_cancel(self._text_job)
-            self._text_job = None
-            self._commit_text()
+        self._flush_text_parse()
         self.search_panel.pack(side="top", fill="x", before=self.paned)
         self.search_panel.entry.focus_set()
         self.search_panel.entry.select_range(0, "end")
@@ -2071,8 +2650,9 @@ class App(tk.Tk):
     # -- 命令执行与视图刷新 ----------------------------------------------------------
 
     def run_command(self, cmd: Command, select_path: Optional[Path] = None) -> bool:
-        """树/搜索替换编辑的唯一入口（保证所有修改经 Command → History）。"""
-        if not self._flush_or_guard_draft():   # P0：pending 草稿先 commit，非法则询问
+        """树/搜索替换编辑的唯一入口（保证所有修改经 Command → History）。
+        rebuild_text=False：连击编辑不强制落盘大 Text，由 500ms 防抖合并落盘一次。"""
+        if not self._flush_or_guard_draft(rebuild_text=False):
             return False
         try:
             cmd.do(self.model)
@@ -2081,14 +2661,61 @@ class App(tk.Tk):
             return False
         self.history.push(cmd)
         self._close_text_txn()  # 树命令断开文本事务（Q2）
-        self.after_model_change(select_path)
+        self.after_model_change(select_path, cmd=cmd, direction="do")
         return True
 
-    def after_model_change(self, select_path: Optional[Path] = None) -> None:
-        self.rebuild_tree(select_path)
-        self._refresh_text_now()
+    def after_model_change(self, select_path: Optional[Path] = None,
+                           cmd: Optional[Command] = None,
+                           direction: str = "do",
+                           text_urgent: bool = False) -> None:
+        """模型变更后同步视图。
+
+        提供 cmd 且非过滤模式 → 局部刷新（只更新受影响的行）；
+        否则（文档级/过滤/批量/未知命令）全量 rebuild_tree（保守兜底）。
+        text_urgent=True：立即落盘 Text（打开/新建等首次填充，不防抖）。
+        """
+        if cmd is not None and self.filter_paths is None \
+                and self._apply_local(cmd, direction, select_path):
+            pass
+        else:
+            self.rebuild_tree(select_path)
+        self._refresh_text_now(text_urgent)
         self.update_status()
         self.search_panel.refresh()
+
+    def _apply_local(self, cmd: Command, direction: str,
+                     select_path: Optional[Path]) -> bool:
+        """局部刷新分发。返回 False 表示需回退全量 rebuild_tree。"""
+        kind = cmd.affected_paths(direction)
+        tp = self.tree_pane
+        k = kind[0]
+        if k == "update":
+            tp.refresh_path(kind[1])
+        elif k == "update_multi":
+            for p in kind[1]:
+                tp.refresh_path(p)
+        elif k == "rename":
+            tp._refresh_parent_children(kind[1])
+        elif k == "insert":
+            tp.refresh_insert(kind[1])
+        elif k == "delete":
+            tp.refresh_delete(kind[1][0], kind[1][1])
+        elif k == "move":
+            tp.refresh_move(kind[1], kind[2])
+        else:
+            return False
+        self._reselect(select_path)
+        return True
+
+    def _reselect(self, path: Optional[Path]) -> None:
+        if path is None:
+            return
+        t = self.tree_pane.tree
+        iid = path_to_iid(path)
+        if t.exists(iid):
+            t.selection_set(iid)
+            t.focus(iid)
+            t.see(iid)
 
     def rebuild_tree(self, select_path: Optional[Path] = None) -> None:
         if select_path is None:
@@ -2103,30 +2730,112 @@ class App(tk.Tk):
                 t.focus(iid)
                 t.see(iid)
 
-    def _refresh_text_now(self) -> None:
+    def _refresh_text_now(self, urgent: bool = False) -> None:
         """模型 → 文本视图（按当前 view_format 渲染；Undo/Redo 后同样遵循）。
-        preserve_draft 场景由调用方控制（Q3：保存后不覆盖非法 Draft）。"""
+        V1.1.1 分档：小文件（<=TEXT_REBUILD_LIMIT）立即同步；大文件仅标记 stale，
+        由 500ms 防抖合并「序列化 + 落盘」一次——连续树编辑不再每次重建 6MB 文档。
+        urgent=True（打开/新建/保存后）：立即落盘，不防抖。"""
         self._from_tree = True
         try:
-            text = self.model.to_text(self.pretty, self.indent)
-            self.text_pane.set_text(text)
-            self._last_synced_text = text
-            self.draft_valid = True
-            self.text_pane.clear_error()
-            if len(text) > TEXT_WARN_LIMIT:
-                self.set_status("warn", "文本较大（%.1f MB），文本视图可能较慢，建议用树视图编辑"
-                                % (len(text) / 1048576))
+            if urgent or not self._big_text_rebuild:
+                text = self.model.to_text(self.pretty, self.indent)
+                self._schedule_text_set(text, urgent)
+            else:
+                self._mark_text_stale()
         finally:
             self._from_tree = False
+
+    def _mark_text_stale(self) -> None:
+        """大文件：树编辑后仅标记 Text 过期，500ms 防抖内合并为一次重建。"""
+        if self._text_rebuild_job:
+            self.after_cancel(self._text_rebuild_job)
+            self._text_rebuild_job = None
+        self._pending_text = None
+        self._text_stale = True
+        self._text_rebuild_job = self.after(TEXT_REBUILD_DELAY,
+                                            self._flush_text_rebuild)
+
+    def _schedule_text_set(self, text: str, urgent: bool = False) -> None:
+        """按大小分档落盘 Text：<=TEXT_REBUILD_LIMIT 立即；更大则 500ms 防抖合并。"""
+        if self._text_rebuild_job:
+            self.after_cancel(self._text_rebuild_job)
+            self._text_rebuild_job = None
+        self._pending_text = text
+        self._text_stale = False
+        if urgent or len(text) <= TEXT_REBUILD_LIMIT:
+            self._flush_text_rebuild()
+            return
+        self._text_rebuild_job = self.after(TEXT_REBUILD_DELAY,
+                                            self._flush_text_rebuild)
+
+    def _flush_text_rebuild(self) -> None:
+        """把待重建 Text 真正写入，并同步 _last_synced_text / draft_valid。
+        大文件 stale 路径在落盘时才序列化（连击编辑只序列化一次）。
+        用户切到文本区（FocusIn）或任何即将使用 Model/Text 的时机前调用。"""
+        if self._text_rebuild_job:
+            self.after_cancel(self._text_rebuild_job)
+            self._text_rebuild_job = None
+        text = self._pending_text
+        if text is None:
+            if not self._text_stale:
+                return
+            text = self.model.to_text(self.pretty, self.indent)
+        self._pending_text = None
+        self._text_stale = False
+        self._text_dirty = False
+        self.text_pane.set_text(text)
+        self._last_synced_text = text
+        self.draft_valid = True
+        self.text_pane.clear_error()
+        if len(text) > TEXT_WARN_LIMIT:
+            self.set_status("warn", "文本较大（%.1f MB），文本视图可能较慢，建议用树视图编辑"
+                            % (len(text) / 1048576))
 
     # -- 文本 → 模型（三状态：Draft 可暂时非法；事务 merge） ---------------------------
 
     def on_text_changed(self) -> None:
+        """文本编辑后按文件大小分档调度解析（V1.1）：
+        <2MB 实时（300ms）；2~8MB 中档（600ms）；>8MB 暂停实时解析，
+        仅在保存 / Ctrl+Enter / 离开编辑区 / 打开/关闭前由 _flush_text_parse 解析。"""
         if self._from_tree:
             return
         if self._text_job:
             self.after_cancel(self._text_job)
-        self._text_job = self.after(300, self._commit_text)
+            self._text_job = None
+        # V1.1.1：用户接管文本编辑 → 丢弃待落盘的 Text 重建（以用户输入为准）
+        if self._text_rebuild_job:
+            self.after_cancel(self._text_rebuild_job)
+            self._text_rebuild_job = None
+        self._pending_text = None
+        self._text_stale = False
+        self._text_dirty = True
+        try:
+            # Text.count 在不同 Tk 版本参数顺序/返回值不一致，直接用 -chars 选项
+            n = int(self.tk.call(self.text_pane.text._w, "count",
+                                 "-chars", "1.0", "end-1c"))
+        except tk.TclError:
+            n = 0
+        if n > TEXT_WARN_LIMIT:
+            if not self._pending_parse:
+                self._pending_parse = True
+                self.set_status("info", "大文件：已暂停实时解析，保存/离开编辑区时解析")
+            return
+        delay = PARSE_DEBOUNCE_MID if n > PARSE_MID_LIMIT else PARSE_DEBOUNCE_SMALL
+        self._text_job = self.after(delay, self._commit_text)
+
+    def _flush_text_parse(self, rebuild_text: bool = True) -> None:
+        """立即解析 pending 草稿（保存/打开/关闭前、Ctrl+Enter、离开编辑区）。
+        V1.1.1：默认先落盘待重建的 Text（保证 Text 与最新 Model 一致），再处理 Draft。
+        rebuild_text=False（树命令连击路径）：跳过 Text 落盘——树命令只碰 Model，
+        落盘交给 500ms 防抖合并，避免每次编辑都 delete+insert 整个大文档。"""
+        if rebuild_text:
+            self._flush_text_rebuild()
+        if self._text_job:
+            self.after_cancel(self._text_job)
+            self._text_job = None
+        if self._pending_parse:
+            self._pending_parse = False
+        self._commit_text()
 
     def _close_text_txn(self) -> None:
         self._text_txn_open = False
@@ -2144,8 +2853,11 @@ class App(tk.Tk):
         self._text_job = None
         if self._from_tree:
             return
+        if not self._text_dirty:
+            return  # V1.1.1：用户未编辑文本 → 免读大文件全文比较（Model 与 Text 已同步）
         text = self.text_pane.get_text()
         if text == self._last_synced_text:
+            self._text_dirty = False
             return
         r = parse_json_text(text)
         if r.ok:
@@ -2153,6 +2865,7 @@ class App(tk.Tk):
             cmd.do(self.model)          # 模型更新（mutation_scope 由命令基类管理）
             self._push_text_cmd(cmd)    # merge 入历史
             self._last_synced_text = text
+            self._text_dirty = False
             self.draft_valid = True
             self.text_pane.clear_error()
             self.rebuild_tree()
@@ -2171,16 +2884,14 @@ class App(tk.Tk):
 
     # -- undo / redo（硬约束②③：Save 不清历史；View 操作不进历史） --------------------
 
-    def _flush_or_guard_draft(self) -> bool:
+    def _flush_or_guard_draft(self, rebuild_text: bool = True) -> bool:
         """Model Boundary（P0 统一入口）：任何即将读取/修改/保存 Model 或覆盖
         Text 的操作（树命令/undo/redo/保存/打开/格式化）之前必须调用。
-        ① pending 防抖 commit → 立即同步 commit（合法草稿不丢）；
+        ① pending 防抖 commit（含 >8MB 暂停模式）→ 立即同步 commit（合法草稿不丢）；
         ② Draft 非法 → 询问放弃/返回修复。
+        rebuild_text=False：树命令连击路径——不落盘待重建的 Text（防抖合并负责）。
         返回 False 表示用户中止，调用方不得继续。"""
-        if self._text_job:
-            self.after_cancel(self._text_job)
-            self._text_job = None
-            self._commit_text()
+        self._flush_text_parse(rebuild_text)
         if not self.draft_valid:
             return self._ensure_draft_ok()
         return True
@@ -2188,25 +2899,27 @@ class App(tk.Tk):
     def do_undo(self) -> None:
         if not self._flush_or_guard_draft():
             return
+        sel = self._selected_path()   # 记录撤销前选中，局部刷新后恢复
         try:
-            self.history.undo(self.model)
+            cmd = self.history.undo(self.model)
         except HistoryError as e:
             self.set_status("error", str(e))
             return
         self._close_text_txn()
-        self.after_model_change()
+        self.after_model_change(select_path=sel, cmd=cmd, direction="undo")
         self.set_status("ok", "已撤销")
 
     def do_redo(self) -> None:
         if not self._flush_or_guard_draft():
             return
+        sel = self._selected_path()   # 记录重做前选中，局部刷新后恢复
         try:
-            self.history.redo(self.model)
+            cmd = self.history.redo(self.model)
         except HistoryError as e:
             self.set_status("error", str(e))
             return
         self._close_text_txn()
-        self.after_model_change()
+        self.after_model_change(select_path=sel, cmd=cmd, direction="do")
         self.set_status("ok", "已重做")
 
     # -- 树操作 -------------------------------------------------------------------
@@ -2215,10 +2928,10 @@ class App(tk.Tk):
         """以 focus item 为准（Treeview 键盘操作围绕 focus），selection 兜底。"""
         tree = self.tree_pane.tree
         item = tree.focus()
-        if not item or item.endswith(PH_SUFFIX):
+        if not item or item.endswith(PH_SUFFIX) or PG_SUFFIX in item:
             sel = tree.selection()
             item = sel[0] if sel else None
-        if not item or item.endswith(PH_SUFFIX):
+        if not item or item.endswith(PH_SUFFIX) or PG_SUFFIX in item:
             return None
         return iid_to_path(item)
 
@@ -2437,6 +3150,7 @@ class App(tk.Tk):
         self.had_comments = r.had_comments
         self._saved_stat = file_stat(path)
         self._node_count = self.model.count_nodes()
+        self._big_text_rebuild = len(text) > TEXT_REBUILD_LIMIT  # V1.1.1：大文件启用 Text 防抖
         self._saved_format = (self.pretty, self.indent)
         self.view_dirty = False
         self.history.clear()
@@ -2445,7 +3159,8 @@ class App(tk.Tk):
         self.search_panel.filter_var.set(False)
         self._text_txn_open = False
         self._last_synced_text = None
-        self.after_model_change()
+        self._text_dirty = False
+        self.after_model_change(text_urgent=True)   # 首次填充立即落盘，不走防抖
         self.set_status("ok", "已打开 %s（%s，%d 个节点%s）"
                         % (os.path.basename(path), enc, self._node_count,
                            "，含注释" if r.had_comments else ""))
@@ -2503,7 +3218,7 @@ class App(tk.Tk):
         self._close_text_txn()
         self.update_status()
         if self.draft_valid:
-            self._refresh_text_now()         # Q3：Draft 非法时不覆盖文本区
+            self._refresh_text_now(urgent=True)  # Q3：Draft 非法时不覆盖文本区；保存后立即落盘
             self._last_synced_text = text
             self.set_status("ok", "已保存 %s（已生成 .bak 备份）" % os.path.basename(path))
         else:
@@ -2520,12 +3235,22 @@ class App(tk.Tk):
         return True
 
     def _on_close_request(self) -> None:
+        self._flush_text_parse()  # 关闭前解析 pending 草稿（含 >8MB 暂停模式）
         if (self.model.model_dirty or not self.draft_valid) \
                 and not self._confirm_discard():
             return
         self.destroy()
 
     # -- 状态栏 / 标题 / 帮助 --------------------------------------------------------
+
+    def _update_cursor_pos(self, _e=None) -> None:
+        """V1.1：状态栏 Ln/Col（Text 光标位置，KeyRelease/ButtonRelease 时更新）。"""
+        try:
+            idx = self.text_pane.text.index("insert")
+        except tk.TclError:
+            return
+        line, col = idx.split(".")
+        self.st_pos.configure(text="Ln %s, Col %d" % (line, int(col) + 1))
 
     def set_status(self, kind: str, msg: str) -> None:
         th = THEMES[self.theme_name]
@@ -2550,8 +3275,18 @@ class App(tk.Tk):
 
     def _refresh_title(self) -> None:
         name = os.path.basename(self.model.file_path) if self.model.file_path else "未命名"
-        self.title("%s — %s%s" % (APP_NAME, name,
-                                  " *" if self.model.model_dirty else ""))
+        self.title("%s %s — %s%s" % (APP_NAME, APP_VERSION, name,
+                                     " *" if self.model.model_dirty else ""))
+
+    def _show_about(self) -> None:
+        """关于对话框：版本号与运行时信息（与 --version 同源 APP_VERSION）。"""
+        tkver = self.tk.call("info", "patchlevel")
+        messagebox.showinfo(
+            "关于 %s" % APP_NAME,
+            "%s %s\n\nJSON 语义保真编辑器：结构树 + 文本双视图，\n"
+            "单节点局部刷新、大文件分档解析、零第三方依赖。\n\n"
+            "Python %s · Tk %s" % (APP_NAME, APP_VERSION,
+                                   sys.version.split()[0], tkver))
 
     def _show_help(self) -> None:
         mod = "Cmd" if IS_MAC else "Ctrl"
@@ -2620,6 +3355,9 @@ def _ensure_utf8_stdio() -> None:
 
 def main(argv: List[str]) -> int:
     _ensure_utf8_stdio()
+    if "--version" in argv or "-V" in argv:
+        print("%s %s" % (APP_NAME, APP_VERSION))
+        return 0
     if "--selftest" in argv:
         return _selftest()
     _run_gui(argv)
@@ -2629,7 +3367,8 @@ def main(argv: List[str]) -> int:
 def _run_gui(argv: List[str]) -> None:
     app = App()
     for a in argv:  # 命令行传入文件路径（文件关联的入口）
-        if a and a != "--selftest" and os.path.isfile(a):
+        if a and a not in ("--selftest", "--version", "-V") \
+                and os.path.isfile(a):
             app.open_file(a)
             break
     app.mainloop()

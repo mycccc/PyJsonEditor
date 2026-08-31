@@ -9,6 +9,7 @@ permissions:
   contents: write
 
 jobs:
+  # ---- 阶段 1：三平台测试（数据层 selftest + GUI 冒烟） ----
   test:
     name: Verify - ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
@@ -46,9 +47,12 @@ jobs:
       - name: Run data-layer selftest
         run: python pyjsoneditor.py --selftest
 
+      - name: Run benchmark baseline
+        run: python tests/bench_v1_1.py
+
       # GUI 冒烟：macOS runner 无 WindowServer 会话，Aqua Tk 下合成按键事件不派发，
       # event_generate 会静默失效（真机 macOS 桌面 47/47 全通过，可本地验证）。
-      # 故 GUI smoke 仅在 Linux(Xvfb) 与 Windows 执行，macOS 只跑数据层自测。
+      # 故 GUI smoke 仅在 Linux(Xvfb) 与 Windows 执行，macOS 只跑数据层自测 + benchmark。
       - name: Run GUI smoke test (Xvfb)
         if: runner.os == 'Linux'
         run: xvfb-run -a python tests/gui_smoke.py
@@ -57,17 +61,115 @@ jobs:
         if: runner.os == 'Windows'
         run: python tests/gui_smoke.py
 
+  # ---- 阶段 2：macOS 双架构打包（V1.1 正式产物，PyInstaller 目录模式 .app + zip） ----
+  build:
+    name: Build macOS ${{ matrix.arch }}
+    needs: test
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-latest   # arm64（Apple Silicon）
+            arch: arm64
+          - runner: macos-13       # x86_64（Intel）
+            arch: x64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install PyInstaller
+        run: pip install pyinstaller
+
+      - name: Build .app (directory mode) and zip
+        run: |
+          pyinstaller --noconfirm --clean --windowed --name PyJsonEditor pyjsoneditor.py
+          mkdir -p "dist/PyJsonEditor-macos-${{ matrix.arch }}"
+          mv "dist/PyJsonEditor.app" "dist/PyJsonEditor-macos-${{ matrix.arch }}/"
+          cd dist
+          zip -r "PyJsonEditor-v1.1.0-macos-${{ matrix.arch }}.zip" \
+            "PyJsonEditor-macos-${{ matrix.arch }}"
+
+      # .app 启动验收：--version 不依赖 WindowServer，可验证二进制可执行 + 版本正确
+      - name: Verify .app binary version
+        run: |
+          "dist/PyJsonEditor-macos-${{ matrix.arch }}/PyJsonEditor.app/Contents/MacOS/PyJsonEditor" --version
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.arch }}
+          path: dist/PyJsonEditor-v1.1.0-macos-${{ matrix.arch }}.zip
+          if-no-files-found: error
+
+  # ---- 阶段 2b：Windows / Linux 构建冒烟（不产出 Release 物，v1.2 正式化依据） ----
+  build-smoke:
+    name: Build smoke ${{ matrix.os }}
+    needs: test
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install PyInstaller
+        run: pip install pyinstaller
+
+      - name: PyInstaller build smoke
+        run: pyinstaller --noconfirm --clean --windowed --name PyJsonEditor pyjsoneditor.py
+
+      - name: Verify built binary version
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            "dist/PyJsonEditor/PyJsonEditor.exe" --version
+          else
+            "dist/PyJsonEditor/PyJsonEditor" --version
+          fi
+
+  # ---- 阶段 3：创建 Release 并上传两个 macOS zip ----
   release:
     name: Create GitHub Release
-    needs: test
+    needs: [test, build, build-smoke]
     runs-on: ubuntu-latest
 
     steps:
-      - name: Create Release
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -la release-assets
+
+      - name: Create Release and upload
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release create "${{ github.ref_name }}" \
             --repo "${{ github.repository }}" \
             --title "PyJsonEditor ${{ github.ref_name }}" \
-            --generate-notes
+            --notes-file RELEASE_NOTES.md \
+            release-assets/*.zip

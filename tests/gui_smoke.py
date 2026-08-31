@@ -276,6 +276,41 @@ def step8():
     check("object move keeps selection",
           list(app.model.root["nested"].keys())[0] == "ok"
           and t.focus() == key)
+    app.after(50, step9)
+
+
+def step9():
+    """V1.1 UI：版本 / Toolbar 分组 / 状态栏 Ln·Col / Copy 三件套。"""
+    check("app version 1.1.0", je.APP_VERSION == "1.1.0")
+    check("window title has version", je.APP_VERSION in app.title())
+    # Toolbar 分组：格式化/展开 Menubutton 下拉
+    mbs = [w.cget("text") for w in app.toolbar.winfo_children()
+           if isinstance(w, je.ttk.Menubutton)]
+    check("toolbar format menubutton", any("格式化" in t for t in mbs))
+    check("toolbar expand menubutton", any("展开" in t for t in mbs))
+    # 状态栏 Ln/Col
+    app.text_pane.text.mark_set("insert", "2.3")
+    app._update_cursor_pos()
+    check("status Ln/Col", app.st_pos.cget("text") == "Ln 2, Col 4")
+    # Copy 三件套：选中 ["items", 0]（值 "a"）
+    # monkeypatch 剪贴板写入（真实 clipboard 在 macOS 无头/CI 环境可能阻塞）
+    t = app.tree_pane.tree
+    tp = app.tree_pane
+    captured = []
+    orig_clear, orig_append = tp.clipboard_clear, tp.clipboard_append
+    tp.clipboard_clear = lambda: None
+    tp.clipboard_append = lambda s: captured.append(s)
+    app.open_paths = {(), ("items",), ("nested",)}
+    app.rebuild_tree()
+    t.selection_set('["items", 0]')
+    tp._copy_path()
+    check("copy path JSONPath", captured and captured[-1] == "$.items[0]")
+    tp._copy_value()
+    check("copy value raw", captured and captured[-1] == "a")
+    tp._copy_json()
+    check("copy json literal", captured and captured[-1] == '"a"')
+    tp.clipboard_clear = orig_clear
+    tp.clipboard_append = orig_append
     app.after(50, finish)
 
 
